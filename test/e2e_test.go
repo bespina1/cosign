@@ -3584,6 +3584,10 @@ func TestSaveLoad(t *testing.T) {
 			// if we are not using protobuf bundle format
 			if !test.newBundle {
 				must(verifyLocal(pubKeyPath, imageDir, true, nil, ""), t)
+			} else {
+				bundleVerifyLocalCmd := bundleVerifyCmd
+				bundleVerifyLocalCmd.LocalImage = true
+				must(bundleVerifyLocalCmd.Exec(ctx, []string{imageDir}), t)
 			}
 
 			// load the image from the temp dir into a new image and verify the new image
