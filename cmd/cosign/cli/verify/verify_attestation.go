@@ -119,13 +119,20 @@ func (c *VerifyAttestationCommand) Exec(ctx context.Context, images []string) (e
 	}
 	vOfflineKey := verifyOfflineWithKey(c.KeyRef, c.CertRef, c.Sk, co)
 
-	// Check to see if we are using the new bundle format or not
-	if !c.LocalImage {
-		ref, err := name.ParseReference(images[0], c.NameOptions...)
-		if err == nil && c.NewBundleFormat {
-			newBundles, _, err := cosign.GetBundles(ctx, ref, co.RegistryClientOpts, c.NameOptions...)
-			if len(newBundles) == 0 || err != nil {
+	// Check to see if we are using the new bundle format or not.
+	if c.NewBundleFormat {
+		if c.LocalImage {
+			hasLocalBundles, err := cosign.HasLocalBundles(ctx, images[0])
+			if !hasLocalBundles || err != nil {
 				co.NewBundleFormat = false
+			}
+		} else {
+			ref, err := name.ParseReference(images[0], c.NameOptions...)
+			if err == nil {
+				newBundles, _, err := cosign.GetBundles(ctx, ref, co.RegistryClientOpts, c.NameOptions...)
+				if len(newBundles) == 0 || err != nil {
+					co.NewBundleFormat = false
+				}
 			}
 		}
 	}

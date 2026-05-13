@@ -27,6 +27,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	ocilayout "github.com/sigstore/cosign/v3/pkg/oci/layout"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/protobuf/proto"
 
@@ -123,6 +124,82 @@ func TestGetBundles_Valid(t *testing.T) {
 	if !proto.Equal(bundles[0].Bundle, &expected) {
 		t.Errorf("got %v, want %v", bundles[0].Bundle, &expected)
 	}
+}
+
+func TestGetLocalBundles_Valid(t *testing.T) {
+	path := writeLocalBundleLayout(t, testAttestation)
+
+	bundles, hash, err := GetLocalBundles(context.Background(), path)
+	assert.NoError(t, err)
+	assert.Len(t, bundles, 1)
+	assert.NotNil(t, hash)
+
+	expected := sgbundle.Bundle{}
+	err = expected.UnmarshalJSON(testAttestation)
+	assert.NoError(t, err)
+	if !proto.Equal(bundles[0].Bundle, &expected) {
+		t.Errorf("got %v, want %v", bundles[0].Bundle, &expected)
+	}
+}
+
+func TestVerifyLocalImageAttestationsSigstoreBundle(t *testing.T) {
+	path := writeLocalBundleLayout(t, testAttestation)
+
+	trustedRoot, err := root.NewTrustedRootFromJSON(testTrustedRootPGI)
+	assert.NoError(t, err)
+
+	atts, bundleVerified, err := VerifyLocalImageAttestations(context.Background(), path, &CheckOpts{
+		TrustedMaterial: trustedRoot,
+		NewBundleFormat: true,
+		Identities: []Identity{
+			{
+				IssuerRegExp:  ".*",
+				SubjectRegExp: ".*",
+			},
+		},
+	})
+	assert.NoError(t, err)
+	assert.True(t, bundleVerified)
+	assert.Len(t, atts, 1)
+}
+
+func writeLocalBundleLayout(t *testing.T, bundleBytes []byte) string {
+	t.Helper()
+
+	r := registry.New(registry.WithReferrersSupport(true))
+	s := httptest.NewServer(r)
+	t.Cleanup(s.Close)
+
+	u, err := url.Parse(s.URL)
+	assert.NoError(t, err)
+	ref, err := name.ParseReference(fmt.Sprintf("%s/repo:tag", u.Host))
+	assert.NoError(t, err)
+	assert.NoError(t, remote.Write(ref, empty.Image))
+
+	desc, err := remote.Head(ref)
+	assert.NoError(t, err)
+	digestRef := ref.Context().Digest(desc.Digest.String())
+	assert.NoError(t, ociremote.WriteAttestationNewBundleFormat(digestRef, bundleBytes, "https://cosign.sigstore.dev/attestation/v1"))
+
+	path := t.TempDir()
+	indexManifest, err := ociremote.Referrers(digestRef, "", []ociremote.Option{}...)
+	assert.NoError(t, err)
+
+	for _, manifest := range indexManifest.Manifests {
+		if manifest.ArtifactType == "" {
+			continue
+		}
+		artifactRef := ref.Context().Digest(manifest.Digest.String())
+		si, err := ociremote.SignedImage(artifactRef, []ociremote.Option{}...)
+		assert.NoError(t, err)
+		assert.NoError(t, ocilayout.WriteSignedImage(path, si))
+	}
+
+	si, err := ociremote.SignedImage(ref, []ociremote.Option{}...)
+	assert.NoError(t, err)
+	assert.NoError(t, ocilayout.WriteSignedImage(path, si))
+
+	return path
 }
 
 // TODO: This test is getting long and maybe should be refactored into a
