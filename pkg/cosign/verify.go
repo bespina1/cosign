@@ -32,6 +32,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -1062,6 +1063,10 @@ func VerifyLocalImageAttestations(ctx context.Context, path string, co *CheckOpt
 		return nil, false, errors.New("one of verifier, root certs, or trusted root is required")
 	}
 
+	if co.NewBundleFormat {
+		return verifyLocalImageAttestationsSigstoreBundle(ctx, path, co)
+	}
+
 	se, err := layout.SignedImageIndex(path)
 	if err != nil {
 		return nil, false, err
@@ -1097,6 +1102,161 @@ func VerifyLocalImageAttestations(ctx context.Context, path string, co *CheckOpt
 		return nil, false, err
 	}
 	return VerifyImageAttestation(ctx, atts, h, co)
+}
+
+// HasLocalBundles returns true when a saved local image layout contains Sigstore bundles.
+func HasLocalBundles(ctx context.Context, path string) (bool, error) {
+	bundles, _, err := GetLocalBundles(ctx, path)
+	if err == nil {
+		return len(bundles) > 0, nil
+	}
+
+	var noMatchErr *ErrNoMatchingAttestations
+	if errors.As(err, &noMatchErr) {
+		return false, nil
+	}
+	return false, err
+}
+
+// GetLocalBundles returns Sigstore bundles for a saved local image layout.
+func GetLocalBundles(_ context.Context, path string) ([]*sgbundle.Bundle, *v1.Hash, error) {
+	se, err := layout.SignedImageIndex(path)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	h, err := localSignedEntityHash(se)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	blobPath := filepath.Join(path, "blobs", "sha256")
+	files, err := os.ReadDir(blobPath)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	bundles := make([]*sgbundle.Bundle, 0)
+	for _, file := range files {
+		manifestPath := filepath.Join(blobPath, file.Name())
+		fd, err := os.Open(filepath.Clean(manifestPath))
+		if err != nil {
+			return nil, nil, err
+		}
+		manifest, err := v1.ParseManifest(fd)
+		_ = fd.Close()
+		if err != nil || manifest.Subject == nil {
+			continue
+		}
+		if manifest.Subject.Digest.String() != h.String() {
+			continue
+		}
+		if len(manifest.Layers) != 1 {
+			continue
+		}
+
+		layerDesc := manifest.Layers[0]
+		layerPath := filepath.Join(blobPath, layerDesc.Digest.Hex)
+		bundleBytes, err := os.ReadFile(filepath.Clean(layerPath))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		bundle := &sgbundle.Bundle{}
+		if err := bundle.UnmarshalJSON(bundleBytes); err != nil {
+			continue
+		}
+		if !bundle.MinVersion("v0.3") {
+			continue
+		}
+		bundles = append(bundles, bundle)
+	}
+
+	if len(bundles) == 0 {
+		return nil, nil, &ErrNoMatchingAttestations{
+			fmt.Errorf("no valid bundles exist in local image"),
+		}
+	}
+
+	return bundles, &h, nil
+}
+
+func verifyLocalImageAttestationsSigstoreBundle(ctx context.Context, path string, co *CheckOpts) (checkedAttestations []oci.Signature, atLeastOneBundleVerified bool, err error) {
+	bundles, hash, err := GetLocalBundles(ctx, path)
+	if err != nil {
+		return nil, false, err
+	}
+
+	digestBytes, err := hex.DecodeString(hash.Hex)
+	if err != nil {
+		return nil, false, err
+	}
+
+	artifactPolicyOption := verify.WithArtifactDigest(hash.Algorithm, digestBytes)
+
+	attestations := make([]oci.Signature, len(bundles))
+	bundlesVerified := make([]bool, len(bundles))
+
+	workers := co.MaxWorkers
+	if co.MaxWorkers == 0 {
+		workers = cosign.DefaultMaxWorkers
+	}
+	t := throttler.New(workers, len(bundles))
+	for i, bundle := range bundles {
+		go func(bundle *sgbundle.Bundle, index int) {
+			var att oci.Signature
+			if err := func(bundle *sgbundle.Bundle) error {
+				_, err := VerifyNewBundle(ctx, co, artifactPolicyOption, bundle)
+				if err != nil {
+					return err
+				}
+				dsse, ok := bundle.Content.(*protobundle.Bundle_DsseEnvelope)
+				if !ok {
+					return fmt.Errorf("bundle does not contain a DSSE envelope")
+				}
+				payloadJSON, err := json.Marshal(dsse.DsseEnvelope)
+				if err != nil {
+					return err
+				}
+				sig, err := static.NewAttestation(payloadJSON)
+				if err != nil {
+					return err
+				}
+				att = sig
+				bundlesVerified[index] = true
+				return nil
+			}(bundle); err != nil {
+				t.Done(err)
+				return
+			}
+			attestations[index] = att
+			t.Done(nil)
+		}(bundle, i)
+		t.Throttle()
+	}
+	if err := t.Err(); err != nil {
+		return nil, false, &ErrNoMatchingAttestations{err}
+	}
+	return attestations, bundlesVerified[0], nil
+}
+
+func localSignedEntityHash(se oci.SignedImageIndex) (v1.Hash, error) {
+	ii, err := se.SignedImageIndex(v1.Hash{})
+	if err != nil {
+		return v1.Hash{}, err
+	}
+	i, err := se.SignedImage(v1.Hash{})
+	if err != nil {
+		return v1.Hash{}, err
+	}
+	switch {
+	case ii != nil:
+		return ii.Digest()
+	case i != nil:
+		return i.Digest()
+	default:
+		return v1.Hash{}, errors.New("must verify either an image index or image")
+	}
 }
 
 func VerifyBlobAttestation(ctx context.Context, att oci.Signature, h v1.Hash, co *CheckOpts) (
@@ -1213,16 +1373,11 @@ func VerifyBundle(sig oci.Signature, co *CheckOpts) (bool, error) {
 		return false, errors.New("no trusted rekor public keys provided")
 	}
 
-	bundleBody, ok := bundle.Payload.Body.(string)
-	if !ok {
-		return false, errors.New("bundle payload body is not a string")
-	}
-
-	if err := compareSigs(bundleBody, sig); err != nil {
+	if err := compareSigs(bundle.Payload.Body.(string), sig); err != nil {
 		return false, err
 	}
 
-	if err := comparePublicKey(bundleBody, sig, co); err != nil {
+	if err := comparePublicKey(bundle.Payload.Body.(string), sig, co); err != nil {
 		return false, err
 	}
 
@@ -1235,7 +1390,7 @@ func VerifyBundle(sig oci.Signature, co *CheckOpts) (bool, error) {
 		return false, fmt.Errorf("reading base64signature: %w", err)
 	}
 
-	alg, bundlehash, err := bundleHash(bundleBody, signature)
+	alg, bundlehash, err := bundleHash(bundle.Payload.Body.(string), signature)
 	if err != nil {
 		return false, fmt.Errorf("computing bundle hash: %w", err)
 	}
@@ -1254,7 +1409,7 @@ func VerifyBundle(sig oci.Signature, co *CheckOpts) (bool, error) {
 		if err != nil {
 			return false, fmt.Errorf("decoding log ID: %w", err)
 		}
-		body, _ := base64.StdEncoding.DecodeString(bundleBody)
+		body, _ := base64.StdEncoding.DecodeString(payload.Body.(string))
 		entry, err := tlog.NewEntry(body, payload.IntegratedTime, payload.LogIndex, logID, bundle.SignedEntryTimestamp, nil)
 		if err != nil {
 			return false, fmt.Errorf("converting tlog entry: %w", err)
