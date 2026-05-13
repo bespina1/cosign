@@ -1,0 +1,23 @@
+[
+  {
+    "instance_id": "sigstore__cosign__4626",
+    "task_title": "Allow --local-image with --new-bundle-format for v2 and v3 signatures",
+    "problem_statement": "Cosign can verify images saved locally with `cosign save`, but the local verification path does not properly support the new Sigstore bundle format. Right now `verify` and `verify-attestation` reject `--local-image` together with `--new-bundle-format`, and saved OCI layouts containing new-format referrer bundles are not handled the same way as remote images. Update local verification so a saved image can be verified from disk when it contains either legacy signatures/attestations or new-format Sigstore bundles.",
+    "problem_statement_variant": "Saved OCI layouts are treated differently from remote images during verification. Cosign should be able to inspect a locally saved image directory, detect whether it contains legacy verification material or newer Sigstore bundles, and verify it correctly without forcing users away from `--new-bundle-format`.",
+    "hints": "The key paths are `cmd/cosign/cli/options/verify.go`, `cmd/cosign/cli/verify/verify.go`, `cmd/cosign/cli/verify/verify_attestation.go`, and `pkg/cosign/verify.go`. The current issue shows up in the local-image flag handling and in the absence of a local equivalent to remote bundle discovery. Existing nearby coverage lives in `pkg/cosign/verify_oci_test.go` and `test/e2e_test.go`.",
+    "repo": "sigstore/cosign",
+    "repo_path_or_url": "https://github.com/sigstore/cosign",
+    "FAIL_TO_PASS": "cmd/cosign/cli/verify_test.go,pkg/cosign/verify_oci_test.go",
+    "PASS_TO_PASS": "pkg/oci/layout/write_test.go,cmd/cosign/cli/verify/verify_test.go",
+    "language": "Go",
+    "docker_file": ".helix/Dockerfile.helix",
+    "run_script": ".helix/run-tests-eval.sh",
+    "task_type": "bugfix",
+    "task_category": "verification",
+    "repo_category": "cli",
+    "version": "v3",
+    "container_mem": "8g",
+    "container_memswap": "8g",
+    "container_network_needed": "false"
+  }
+]
